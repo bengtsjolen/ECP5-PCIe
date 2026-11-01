@@ -14,8 +14,9 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 	"""
 	A PCIe Phy
 	"""
-	def __init__(self, lane, upstream = True, support_5GTps = True, disable_scrambling = False):
+	def __init__(self, lane, upstream = True, support_5GTps = True, disable_scrambling = False, transaction_layer = True):
 		self.upstream = upstream
+		self.transaction_layer = transaction_layer
 		
 		# PHY
 		self.descrambled_lane = PCIeScrambler(lane)#, Signal())
@@ -36,7 +37,12 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		self.debug2 = Signal(8)
 
 		# TL
-		if self.upstream:
+		# Without a transaction layer, dll_tlp_rx.tlp_source and dll_tlp_tx.tlp_sink are left
+		# for the instantiating module to connect.
+		if not self.transaction_layer:
+			self.tlp = None
+
+		elif self.upstream:
 			self.tlp = TLP()
 		
 		else:
@@ -52,8 +58,9 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 			self.dll,
 			self.dll_tlp_rx,
 			self.dll_tlp_tx,
-			self.tlp,
 		]
+		if self.tlp is not None:
+			self.submodules.append(self.tlp)
 
 		self.state = [
 			self.descrambled_lane.enable,
@@ -82,9 +89,7 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		m.submodules.dll = self.dll
 		m.submodules.dll_tlp_tx = self.dll_tlp_tx
 		m.submodules.dll_tlp_rx = self.dll_tlp_rx
-		if self.upstream:
-			m.submodules.tlp = self.tlp
-		else:
+		if self.tlp is not None:
 			m.submodules.tlp = self.tlp
 
 		m.d.comb += self.dll.speed.eq(self.descrambled_lane.speed)
@@ -95,7 +100,10 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		self.dll_tlp_tx.dllp_source.connect(self.dllp_tx.dllp_sink, m.d.comb)
 		self.dllp_rx.dllp_source.connect(self.dll_tlp_rx.dllp_sink, m.d.comb)
 
-		if self.upstream:
+		if self.tlp is None:
+			pass
+
+		elif self.upstream:
 			self.tlp.tlp_source.connect(self.dll_tlp_tx.tlp_sink, m.d.comb)
 			self.dll_tlp_rx.tlp_source.connect(self.tlp.tlp_sink, m.d.comb)
 		
