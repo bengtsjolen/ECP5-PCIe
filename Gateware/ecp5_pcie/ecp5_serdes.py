@@ -85,11 +85,13 @@ class LatticeECP5PCIeSERDES(Elaboratable): # Based on Yumewatari
 			assert clkfreq == 200e6
 			self.divide_clk = self.lane.speed
 		else:
-			assert clkfreq == 100e6 or clkfreq == 200e6
-			if(clkfreq == 100e6):
-				self.divide_clk = 0
+			assert clkfreq in (100e6, 156.25e6, 200e6)
 			if(clkfreq == 200e6):
 				self.divide_clk = 1
+			else:
+				self.divide_clk = 0
+		# REFCLK multiplier giving a 2.5 GHz (or 5 GHz at 200 MHz) PLL output.
+		self.refck_mode = {100e6: "0b100", 156.25e6: "0b010", 200e6: "0b100"}[clkfreq] # 25x, 16x, 25x
 
 		self.speed_5GTps = speed_5GTps
 
@@ -443,7 +445,7 @@ class LatticeECP5PCIeSERDES(Elaboratable): # Based on Yumewatari
 			# DCU — clocking
 			"i_D_REFCLKI"             :self.ref_clk,
 			"o_D_FFS_PLOL"            :tx_lol,
-			"p_D_REFCK_MODE"          :"0b100",   # 25x ref_clk
+			"p_D_REFCK_MODE"          :self.refck_mode,
 			"p_D_TX_MAX_RATE"         :"5.0" if self.speed_5GTps else "2.5", # How many Gbps
 			"p_D_TX_VCO_CK_DIV"       :"0b000",   # DIV/1
 			"p_D_BITCLK_LOCAL_EN"     :"0b1",     # undocumented (PCIe sample code used)

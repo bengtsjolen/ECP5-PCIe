@@ -24,19 +24,26 @@ class ECP5PCIeCore(Elaboratable):
 	Parameters
 	----------
 	gen : int
-		1 for 2.5 GT/s with a 100 MHz reference clock, 2 for 5 GT/s with a 200 MHz reference clock.
+		1 for 2.5 GT/s, 2 for 5 GT/s.
+	refclk_freq : float
+		DCU reference clock in Hz: 100 MHz or 156.25 MHz for Gen1 (default 100 MHz), 200 MHz for
+		Gen2.
 	fabric_clk : bool
 		Use the ``sync`` clock as DCU reference clock instead of EXTREF0.
 	transaction_layer : bool
 		Include the ECP5-PCIe config-space responder. The ``tlp_*`` ports then only observe the
 		DLL streams; ``tlp_rx_ready`` is ignored and ``tlp_tx_ready`` is 0.
 	"""
-	def __init__(self, gen=1, fabric_clk=False, transaction_layer=False):
+	def __init__(self, gen=1, refclk_freq=None, fabric_clk=False, transaction_layer=False):
 		assert gen in (1, 2)
+		if refclk_freq is None:
+			refclk_freq = 100e6 if gen == 1 else 200e6
+		assert refclk_freq in ((100e6, 156.25e6) if gen == 1 else (200e6,))
+		assert not (fabric_clk and refclk_freq != 100e6)
 		self.gen = gen
 		self.transaction_layer = transaction_layer
 
-		self.serdes  = LatticeECP5PCIeSERDESx4(speed_5GTps=(gen == 2), clkfreq=(100e6 if gen == 1 else 200e6), fabric_clk=fabric_clk)
+		self.serdes  = LatticeECP5PCIeSERDESx4(speed_5GTps=(gen == 2), clkfreq=refclk_freq, fabric_clk=fabric_clk)
 		self.aligner = DomainRenamer("rx")(PCIeSERDESAligner(self.serdes.lane))
 		self.phy     = PCIePhy(self.aligner, support_5GTps=(gen == 2), transaction_layer=transaction_layer)
 

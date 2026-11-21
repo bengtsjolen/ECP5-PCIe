@@ -323,10 +323,12 @@ class PCIeDLL(Elaboratable): # Based on Yumewatary phy.py
 					self.tx.dllp.data.eq(self.scheduled_ack_nak_id),
 					self.tx.dllp.valid.eq(1),
 					self.tx.send.eq(1),
-					send_ack_nak.eq(0),
 				]
 
 				with m.If(self.tx.started_sending):
+					# An Ack/Nak scheduled while this one goes out is sent next, with the newer ID.
+					with m.If(~self.schedule_ack_nak):
+						m.d.rx += send_ack_nak.eq(0)
 					m.next = "Idle"
 
 		return m

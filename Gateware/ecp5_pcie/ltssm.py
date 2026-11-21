@@ -606,10 +606,11 @@ class PCIeLTSSM(Elaboratable): # Based on Yumewatary phy.py
 				m.d.rx += timer.eq(timer + 1)
 
 				# Send TS1 ordered sets with same Link and Lane as configured
+				# LinkUp stays set through Recovery (PCIe Base 4.2.6.4); only Detect clears it, so
+				# the DLL stays DL_Active across a retrain.
 				m.d.rx += [
 					tx.ts.valid.eq(1),
 					tx.ts.ts_id.eq(0),
-					status.link.up.eq(0), # Not sure if this is right
 					rx.ready.eq(0),
 					tx.ready.eq(0),
 					tx.ts.rate.speed_change.eq(tx.ts.rate.speed_change | status.directed_speed_change),
@@ -701,8 +702,14 @@ class PCIeLTSSM(Elaboratable): # Based on Yumewatary phy.py
 					m.d.rx += last_ts.eq(0)
 					reset_ts_count_and_jump(State.Recovery_Idle)
 				
-				# If 8 TS1s have been received and 16 TS2s sent, go back to Configuration
-				with m.If((rx_ts_count == 8) & (rx.ts.ts_id == 0) & (tx_ts_count == 16) & (rx.ts.rate.speed_change == 0)):
+				# 8 TS1s with Link or Lane numbers differing from the configured ones send the link
+				# back to Configuration (PCIe Base 4.2.6.4.4). Matching TS1s are the partner still in
+				# Recovery.RcvrLock; keep waiting for its TS2s.
+				renumbered = (~rx.ts.link.valid | ~rx.ts.lane.valid |
+					(rx.ts.link.number != tx.ts.link.number) |
+					(rx.ts.lane.number != tx.ts.lane.number))
+				with m.If((rx_ts_count == 8) & (rx.ts.ts_id == 0) & (tx_ts_count == 16) & (rx.ts.rate.speed_change == 0) &
+					renumbered):
 					reset_ts_count_and_jump(State.Configuration)
 
 
