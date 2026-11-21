@@ -46,6 +46,8 @@ class PCIeDLL(Elaboratable): # Based on Yumewatary phy.py
 		self.rx = rx
 		self.credits_tx = Record(dll_layout)
 		self.credits_rx = Record(dll_layout)
+		self.credits_released = Record(dll_layout)
+		"""Credits of received TLPs whose buffer space is free again, counted since DL_Inactive (modulo field width)"""
 		self.clk_freq = clk_freq
 		self.speed = Signal()
 		self.use_speed = use_speed
@@ -99,10 +101,11 @@ class PCIeDLL(Elaboratable): # Based on Yumewatary phy.py
 			#self.credits_tx.NPD.eq(0xE0),
 			#self.credits_tx.CPLH.eq(0), # Must advertise infinite as root complex or endpoint
 			#self.credits_tx.CPLD.eq(0), #
-			self.credits_tx.PH.eq(2),
-			self.credits_tx.PD.eq(0x20),
-			self.credits_tx.NPH.eq(2),
-			self.credits_tx.NPD.eq(0x02),
+			# InitFC/UpdateFC carry CREDITS_ALLOCATED: initial credits plus everything released
+			self.credits_tx.PH.eq(2 + self.credits_released.PH),
+			self.credits_tx.PD.eq(0x20 + self.credits_released.PD),
+			self.credits_tx.NPH.eq(2 + self.credits_released.NPH),
+			self.credits_tx.NPD.eq(0x02 + self.credits_released.NPD),
 			self.credits_tx.CPLH.eq(0), # Must advertise infinite as root complex or endpoint
 			self.credits_tx.CPLD.eq(0), #
 		]

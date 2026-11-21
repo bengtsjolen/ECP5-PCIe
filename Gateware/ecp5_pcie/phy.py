@@ -107,6 +107,30 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		m.d.comb += self.tx.hold_skp.eq(self.dll_tlp_tx.busy | (self.dll_tlp_tx.tlp_sink.valid[0] & self.dll_tlp_tx.tlp_sink.ready))
 		self.dllp_rx.dllp_source.connect(self.dll_tlp_rx.dllp_sink, m.d.comb)
 
+		# Return flow control credits as each received TLP leaves the RX buffer. Completions
+		# are advertised as infinite and not counted.
+		rx_tlp = self.dll_tlp_rx.tlp_source
+		rx_tlp_prev = Signal()
+		m.d.rx += rx_tlp_prev.eq(rx_tlp.valid[0])
+		fmt_type = rx_tlp.symbol[0]
+		has_data = fmt_type[6]
+		tlp_type = fmt_type[0:5]
+		length = Cat(rx_tlp.symbol[3], rx_tlp.symbol[2][0:2])
+		data_credits = Signal(12)
+		m.d.comb += data_credits.eq(Mux(length == 0, 256, (length + 3) >> 2))
+		released = self.dll.credits_released
+		with m.If(~self.dll.up):
+			m.d.rx += [released.PH.eq(0), released.PD.eq(0), released.NPH.eq(0), released.NPD.eq(0)]
+		with m.Elif(rx_tlp.valid[0] & ~rx_tlp_prev):
+			with m.If(((tlp_type == 0) & has_data) | (tlp_type[3:5] == 0b10)):
+				m.d.rx += released.PH.eq(released.PH + 1)
+				with m.If(has_data):
+					m.d.rx += released.PD.eq(released.PD + data_credits)
+			with m.Elif((tlp_type != 0b01010) & (tlp_type != 0b01011)):
+				m.d.rx += released.NPH.eq(released.NPH + 1)
+				with m.If(has_data):
+					m.d.rx += released.NPD.eq(released.NPD + 1)
+
 		if self.tlp is None:
 			pass
 
