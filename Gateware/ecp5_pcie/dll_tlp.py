@@ -361,7 +361,7 @@ class PCIeDLLTLPReceiver(Elaboratable):
 		self.dllp_sink = StreamInterface(9, ratio, name="DLLP_Sink") # TODO: Maybe connect these in elaborate instead of where this class is instantiated
 
 		# Buffer
-		self.buffer = TLPBuffer(ratio = ratio, max_tlps = 4)
+		self.buffer = TLPBuffer(ratio = ratio, max_tlps = 4, drop_unstorable = True)
 		self.tlp_source = self.buffer.tlp_source
 
 		self.dll = dll
@@ -400,7 +400,7 @@ class PCIeDLLTLPReceiver(Elaboratable):
 
 		# TODO: Send NAK if buffer is full
 		m.submodules.buffer = buffer = self.buffer
-		m.submodules.received_tlp_fifo = received_tlp_fifo = SyncFIFOBuffered(width = 12, depth = buffer.max_tlps)
+		m.submodules.received_tlp_fifo = received_tlp_fifo = DomainRenamer("rx")(SyncFIFOBuffered(width = 12, depth = buffer.max_tlps))
 
 		m.d.comb += self.dll.status.receive_buffer_occupation.eq(buffer.slots_occupied)
 		m.d.comb += self.dll.status.rx_seq_num.eq(self.actual_receive_seq)
@@ -425,7 +425,9 @@ class PCIeDLLTLPReceiver(Elaboratable):
 		reset_crc = Signal(reset = 1)
 		# TODO Warning: Endianness
 		crc_input = Signal(32)
-		m.submodules.lcrc = lcrc = DomainRenamer("rx")(LCRC(crc_input, reset_crc))
+		start_crc = Signal()
+		m.submodules.lcrc = lcrc = DomainRenamer("rx")(LCRC(crc_input, reset_crc, start_crc))
+		m.d.rx += start_crc.eq(0)
 
 		m.d.rx += crc_input.eq(Cat(source_symbols))
 
@@ -464,7 +466,7 @@ class PCIeDLLTLPReceiver(Elaboratable):
 			m.d.comb += Cat(self.debug[0:4]).eq(fsm.state)
 			m.d.comb += Cat(self.debug_state[0:4]).eq(fsm.state)
 
-			with m.State("Idle"):
+			def start_tlp():
 				with m.If(self.dllp_sink.symbol[0] == Ctrl.STP):
 					tlp_id = Cat(source_symbols[3], source_symbols[2][0:4])
 
@@ -472,11 +474,13 @@ class PCIeDLLTLPReceiver(Elaboratable):
 					m.d.rx += buffer.store_tlp_id.eq(tlp_id)
 
 					m.d.rx += reset_crc.eq(0)
+					m.d.rx += start_crc.eq(1)
 					m.d.rx += crc_input.eq(Cat(source_symbols[2], source_symbols[3]))
 					m.d.rx += self.actual_receive_seq.eq(tlp_id)
 					m.next = "Receive"
 
-					m.d.comb += Cat(self.debug[4:8]).eq(0)
+			with m.State("Idle"):
+				start_tlp()
 				
 				#with m.If(self.dll.up  & (self.ack_nak_latency_timer == self.ack_nak_latency_limit) & ~ self.nak_scheduled)
 			
@@ -494,70 +498,69 @@ class PCIeDLLTLPReceiver(Elaboratable):
 						m.d.rx += buffer.tlp_sink.valid[i].eq(1)
 			
 			with m.State("LCRC"):
-				#ack()	
 				m.d.rx += reset_crc.eq(1)
 				m.d.comb += Cat(self.debug[4:8]).eq(7)
 
+				# Only a TLP the buffer stored may be acknowledged; one it had to drop (no free
+				# slot) is ignored and comes back as a replay. A stored copy of anything that
+				# isn't the next TLP in sequence is deleted.
+				def delete_stored():
+					with m.If(buffer.store_ok):
+						m.d.rx += buffer.delete_tlp.eq(1)
+						m.d.rx += buffer.delete_tlp_id.eq(self.actual_receive_seq)
+
 				with m.If((lcrc.output == last_symbols) & end_good):
 					with m.If(self.actual_receive_seq == self.next_receive_seq):
-						m.d.comb += received_tlp_fifo.w_en.eq(1)
-						m.d.comb += received_tlp_fifo.w_data.eq(self.actual_receive_seq)
-						m.d.rx += self.next_receive_seq.eq(self.next_receive_seq + 1)
-						m.d.rx += self.nak_scheduled.eq(0)
-						with m.If(~buffer.slots_full):
-							ack() # This should be fine, really, see PCIe Base 1.1 Page 157 Point 2
+						with m.If(buffer.store_ok):
+							m.d.comb += received_tlp_fifo.w_en.eq(1)
+							m.d.comb += received_tlp_fifo.w_data.eq(self.actual_receive_seq)
+							m.d.rx += self.next_receive_seq.eq(self.next_receive_seq + 1)
+							m.d.rx += self.nak_scheduled.eq(0)
+							ack()
 							m.d.comb += Cat(self.debug[4:8]).eq(1)
-
 						with m.Else():
-							m.next = "Wait"
 							m.d.comb += Cat(self.debug[4:8]).eq(2)
 
 					with m.Elif((self.next_receive_seq - self.actual_receive_seq) <= 2048): # Duplicate received
+						delete_stored()
 						ack()
 						m.d.comb += Cat(self.debug[4:8]).eq(3)
 
 					with m.Else():
-						m.d.rx += buffer.delete_tlp.eq(1)
-						m.d.rx += buffer.delete_tlp_id.eq(self.actual_receive_seq)
+						delete_stored()
 						nak()
 						m.d.comb += Cat(self.debug[4:8]).eq(4)
-				
-				with m.Else():
-					with m.If((~lcrc.output == last_symbols) & ~end_good):
-						m.d.rx += buffer.delete_tlp.eq(1)
-						m.d.rx += buffer.delete_tlp_id.eq(self.actual_receive_seq)
-						m.d.comb += Cat(self.debug[4:8]).eq(5)
 
-					with m.Else(): # TODO: Delete TLP here too?
-						m.d.rx += buffer.delete_tlp.eq(1)
-						m.d.rx += buffer.delete_tlp_id.eq(self.actual_receive_seq)
+				with m.Else():
+					delete_stored()
+					with m.If((~lcrc.output == last_symbols) & ~end_good):
+						m.d.comb += Cat(self.debug[4:8]).eq(5)
+					with m.Else():
 						nak()
 						m.d.comb += Cat(self.debug[4:8]).eq(6)
 
 				m.next = "Idle"
-			
-			with m.State("Wait"): # It goes in this state if there is no free space, after space has been freed it is acknowledged such that the next TLP can be received.
-				with m.If(~buffer.slots_full):
-					ack()
-					m.next = "Idle"
+				# The next TLP can start right after END
+				start_tlp()
 
+		# Deliver TLPs in the order they were accepted
 		with m.FSM(name = "DLL_TLP_to_TLP_rx_FSM", domain = "rx") as fsm:
 			m.d.comb += Cat(self.debug_state[4:8]).eq(fsm.state)
 
 			with m.State("Wait"):
-				with m.If(~self.buffer.slots_empty):
-					tx_id = 0
-					for i in range(len(self.buffer.slots)):
-						tx_id = Mux(self.buffer.slots[i][0], self.buffer.slots[i][1], tx_id)
-					
-					m.d.rx += self.buffer.send_tlp_id.eq(tx_id)
-					m.d.comb += self.buffer.send_tlp.eq(1)
-					m.next = "Send"
-			
+				with m.If(received_tlp_fifo.r_rdy):
+					m.d.rx += self.buffer.send_tlp_id.eq(received_tlp_fifo.r_data)
+					m.next = "Start"
+
+			with m.State("Start"):
+				m.d.comb += self.buffer.send_tlp.eq(1)
+				m.next = "Send"
+
 			with m.State("Send"):
 				with m.If(~self.buffer.sending_tlp):
-					m.d.rx += buffer.delete_tlp.eq(1) # TODO: This might clash with the code further up if two deletes are issued at the same time
-					m.d.rx += buffer.delete_tlp_id.eq(self.buffer.send_tlp_id)
+					m.d.comb += self.buffer.delete2_tlp.eq(1)
+					m.d.comb += self.buffer.delete2_tlp_id.eq(self.buffer.send_tlp_id)
+					m.d.comb += received_tlp_fifo.r_en.eq(1)
 					m.next = "Wait-Delete"
 
 			with m.State("Wait-Delete"):

@@ -22,8 +22,12 @@ class TLPBuffer(Elaboratable):
 	delete_on_send : bool
 		Whether to delete the TLP once it is sent
 	"""
-	def __init__(self, ratio: int = 4, max_tlps: int = 4, tlp_bytes: int = 512, delete_on_send: bool = False):
+	def __init__(self, ratio: int = 4, max_tlps: int = 4, tlp_bytes: int = 512, delete_on_send: bool = False, drop_unstorable: bool = False):
 		self.ratio = ratio
+		self.drop_unstorable = drop_unstorable
+		"""On store_tlp without a free slot (or with the ID already stored), skip that TLP instead of retrying (receive side)"""
+		self.store_ok = Signal()
+		"""Whether the TLP of the last store_tlp is being/was stored"""
 
 		self.tlp_sink = StreamInterface(8, ratio, name="TLP_Sink")
 		"""Connect this to the TLP source, when all_valid goes low it marks the end of a TLP"""
@@ -51,6 +55,9 @@ class TLPBuffer(Elaboratable):
 		"""The ID of the TLP to be deleted, should be set in the same cycle as delete_tlp"""
 		self.delete_tlp = Signal()
 		"""Set to 1 for 1 cycle to delete TLP"""
+		self.delete2_tlp = Signal()
+		self.delete2_tlp_id = Signal(12)
+		"""Second delete port, so two users can't lose each other's deletes"""
 
 		self.store_tlp_id = Signal(12)
 		"""The ID of the TLP to be stored, can be set 1 cycle later than store_tlp"""
@@ -168,10 +175,11 @@ class TLPBuffer(Elaboratable):
 		
 
 		# Dereference pointer
-		with m.If(self.delete_tlp):
-			for i in range(self.max_tlps):
-				with m.If(self.slots[i][0] & (self.delete_tlp_id == self.slots[i][1])):
-					m.d.rx += self.slots[i][0].eq(0)
+		for delete, delete_id in ((self.delete_tlp, self.delete_tlp_id), (self.delete2_tlp, self.delete2_tlp_id)):
+			with m.If(delete):
+				for i in range(self.max_tlps):
+					with m.If(self.slots[i][0] & (delete_id == self.slots[i][1])):
+						m.d.rx += self.slots[i][0].eq(0)
 
 		with m.If(self.ack_enable):
 			for i in range(self.max_tlps):
@@ -181,73 +189,75 @@ class TLPBuffer(Elaboratable):
 					m.d.rx += self.slots[i][0].eq(0)
 
 
-		end_tlp = Signal()
-
 		write_address_base = Signal(range(self.max_tlps))
 		write_address_counter = Signal(range(self.tlp_depth), reset = 0)
-		m.d.comb += write_port.addr.eq(Cat(write_address_counter, write_address_base))
-		m.d.rx += write_port.data.eq(Cat(self.tlp_sink.symbol))
+		write_address = Signal(len(write_port.addr))
+		m.d.comb += write_port.addr.eq(write_address)
 
 		m.d.rx += self.tlp_sink.ready.eq(0)
 		m.d.rx += write_port.en.eq(0)
 
-		tlp_sink_last_valid = Signal(2)
-		m.d.rx += tlp_sink_last_valid.eq(tlp_sink_last_valid << 1)
-		m.d.rx += tlp_sink_last_valid[0].eq(self.tlp_sink.all_valid)
+		tlp_sink_last_valid = Signal()
+		m.d.rx += tlp_sink_last_valid.eq(self.tlp_sink.all_valid)
 
+		# A TLP ends with the first cycle without valid data. The store FSM is back in Idle the
+		# cycle after that, so a TLP whose store_tlp comes right after the previous TLP is kept.
 		with m.FSM(name = "store_fsm", domain = "rx"):
 			offset = 0
 			slot_exists = 0
+			for i in range(self.max_tlps):
+				slot_exists = slot_exists | ((self.slots[i][1] == self.store_tlp_id) & self.slots[i][0])
+				offset = Mux(~self.slots[i][0], i, offset)
+
+			def start_store():
+				m.d.rx += self.storing_tlp.eq(1)
+				m.next = "Set offset"
 
 			with m.State("Idle"):
-				with m.If(self.store_tlp & ~self.slots_full):
-					m.next = "Set offset"
-					m.d.rx += self.storing_tlp.eq(1)
-					
+				with m.If(self.store_tlp & (self.drop_unstorable | ~self.slots_full)):
+					start_store()
 				with m.Else():
 					m.d.rx += self.storing_tlp.eq(0)
 
 			with m.State("Set offset"):
-
-				for i in range(self.max_tlps):
-					slot_exists = slot_exists | ((self.slots[i][1] == self.store_tlp_id) & self.slots[i][0])
-					offset = Mux(~self.slots[i][0], i, offset)
-
-				with m.If(slot_exists):
-					m.next = "Idle"
-
+				with m.If(slot_exists | self.slots_full):
+					m.d.rx += self.store_ok.eq(0)
+					m.next = "Skip" if self.drop_unstorable else "Idle"
 				with m.Else():
 					m.d.rx += write_address_base.eq(offset)
+					m.d.rx += write_address_counter.eq(0)
+					m.d.rx += self.store_ok.eq(1)
 					m.d.rx += self.tlp_sink.ready.eq(1)
-
 					m.next = "Receive"
-			
+
+			with m.State("Skip"):
+				# Let the TLP that can't be stored pass
+				with m.If(~self.tlp_sink.all_valid & tlp_sink_last_valid):
+					m.next = "Idle"
+					with m.If(self.store_tlp):
+						start_store()
+
 			with m.State("Receive"):
 				m.d.rx += self.tlp_sink.ready.eq(1)
 
 				with m.If(self.tlp_sink.all_valid):
-					with m.If(tlp_sink_last_valid[0]):
+					m.d.rx += write_port.data.eq(Cat(Cat(self.tlp_sink.symbol), 0))
+					m.d.rx += write_address.eq(Cat(write_address_counter, write_address_base))
+					m.d.rx += write_port.en.eq(1)
+					with m.If(write_address_counter != self.tlp_depth - 1):
 						m.d.rx += write_address_counter.eq(write_address_counter + 1)
-					m.d.rx += write_port.en.eq(1)
-				
-				with m.Elif(tlp_sink_last_valid[0]):
-					m.d.rx += write_port.en.eq(1)
+
+				with m.Elif(tlp_sink_last_valid):
+					# Rewrite the last word with the end flag and mark the slot
 					m.d.rx += write_port.data.eq(Cat(write_port.data[:-1], 1))
-
-
-				with m.If((write_address_counter == self.tlp_depth - 1) | (~self.tlp_sink.all_valid & ~tlp_sink_last_valid[0] & tlp_sink_last_valid[1])):
+					m.d.rx += write_port.en.eq(1)
 					m.d.rx += self.tlp_sink.ready.eq(0)
-					m.d.rx += write_address_counter.eq(0)
-					m.d.rx += write_port.en.eq(0)
-
-					# Mark the slot the TLP was written to. `offset` is recomputed from the current
-					# slots and points elsewhere once a slot was freed while this TLP was stored.
 					for i in range(self.max_tlps):
 						with m.If(write_address_base == i):
 							m.d.rx += self.slots[i][0].eq(1)
 							m.d.rx += self.slots[i][1].eq(self.store_tlp_id)
-
 					m.next = "Idle"
-
+					with m.If(self.store_tlp & (self.drop_unstorable | ~self.slots_full)):
+						start_store()
 
 		return m

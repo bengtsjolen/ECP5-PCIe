@@ -127,12 +127,14 @@ class LCRC(Elaboratable):
 	reset : Signal()
 		Reset CRC Generator
 	"""
-	def __init__(self, input, reset):
+	def __init__(self, input, reset, start = None):
 		self.input      = input
 		self.init       = 0xFFFFFFFF
 		self.polynomial = 0x04C11DB7
 		self.crc_size   = 32
 		self.reset      = reset
+		self.start      = Const(0) if start is None else start
+		"""Like a falling edge of reset, for a CRC that starts right after the previous one"""
 		self.output     = Signal(self.crc_size, reset = self.init)
 	
 	def elaborate(self, platform): # TODO: Apparently this generates 512 wires
@@ -144,8 +146,8 @@ class LCRC(Elaboratable):
 		self.intermediate = Signal(self.crc_size, reset = self.init)
 
 		if len(self.input) == 32:
-			with m.If(last_reset & ~self.reset):
-				last = self.intermediate
+			with m.If((last_reset | self.start) & ~self.reset):
+				last = Mux(self.start, self.init, self.intermediate)
 				for i in range(16):
 					# The input value is the input data XORed with the last bit of the CRC
 					in_val = self.input[i] ^ last[self.crc_size - 1]
