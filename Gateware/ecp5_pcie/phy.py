@@ -9,6 +9,7 @@ from .dllp import PCIeDLLPTransmitter, PCIeDLLPReceiver
 from .dll import PCIeDLL
 from .virtual_tlp_gen import PCIeVirtualTLPGenerator
 from .tlp import TLP
+from .packet_align import PCIePacketAligner
 
 class PCIePhy(Elaboratable): # Phy might not be the right name for this
 	"""
@@ -24,6 +25,8 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		self.tx = PCIePhyTX(self.descrambled_lane)
 		self.ltssm = PCIeLTSSM(self.descrambled_lane, self.tx, self.rx, upstream=upstream, support_5GTps=support_5GTps, disable_scrambling=disable_scrambling) # It doesn't care whether the lane is scrambled or not, since it only uses it for RX detection in Detect
 		
+		self.packet_aligner = PCIePacketAligner()
+
 		# DLL
 		self.dllp_rx = PCIeDLLPReceiver()
 		self.dllp_tx = PCIeDLLPTransmitter()
@@ -84,6 +87,7 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		m.submodules.tx = self.tx
 		m.submodules.descrambled_lane = self.descrambled_lane
 		m.submodules.ltssm = self.ltssm
+		m.submodules.packet_aligner = self.packet_aligner
 		m.submodules.dllp_rx = self.dllp_rx
 		m.submodules.dllp_tx = self.dllp_tx
 		m.submodules.dll = self.dll
@@ -95,9 +99,12 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		m.d.comb += self.dll.speed.eq(self.descrambled_lane.speed)
 
 		self.dllp_tx.phy_source.connect(self.tx.sink, m.d.comb)
-		self.rx.source.connect(self.dllp_rx.phy_sink, m.d.comb)
+		self.rx.source.connect(self.packet_aligner.sink, m.d.comb)
+		self.packet_aligner.source.connect(self.dllp_rx.phy_sink, m.d.comb)
 
 		self.dll_tlp_tx.dllp_source.connect(self.dllp_tx.dllp_sink, m.d.comb)
+		m.d.comb += self.dllp_tx.hold.eq(self.dll_tlp_tx.busy)
+		m.d.comb += self.tx.hold_skp.eq(self.dll_tlp_tx.busy | (self.dll_tlp_tx.tlp_sink.valid[0] & self.dll_tlp_tx.tlp_sink.ready))
 		self.dllp_rx.dllp_source.connect(self.dll_tlp_rx.dllp_sink, m.d.comb)
 
 		if self.tlp is None:
@@ -137,5 +144,8 @@ class PCIePhy(Elaboratable): # Phy might not be the right name for this
 		m.d.rx += self.descrambled_lane.rx_align.eq(1)
 
 		m.d.rx += self.descrambled_lane.enable.eq(self.ltssm.status.link.scrambling & ~self.tx.sending_ts)
+		# Received ordered sets are parsed from the raw lane, so RX descrambling must not follow
+		# what TX is sending: a SKP sent by TX would leave the word received with it scrambled.
+		m.d.rx += self.descrambled_lane.rx_enable.eq(self.ltssm.status.link.scrambling)
 
 		return m

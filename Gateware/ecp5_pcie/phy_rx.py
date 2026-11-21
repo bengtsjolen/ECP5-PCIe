@@ -99,6 +99,10 @@ class PCIePhyRX(Elaboratable):
 			m.d.rx += last_invert.eq(last_invert - 1)
 
 		m.d.comb += Cat(self.source.valid).eq(0) # TODO: Is this necessary?
+		# The FSM below decides on the raw symbols, but the descrambled ones lag them by one cycle,
+		# so gating the symbols with it would drop the word before every ordered set (often the
+		# END of a packet). The DLL finds packets by their framing symbols, so always pass them.
+		m.d.comb += Cat(self.source.symbol).eq(decoded_lane.rx_symbol)
 
 		# Structure of a TS:
 		# COM Link Lane n_FTS Rate Ctrl ID ID ID ID ID ID ID ID ID ID
@@ -141,7 +145,6 @@ class PCIePhyRX(Elaboratable):
 
 				with m.Elif(self.ready): # Might overflow
 					m.d.comb += Cat(self.source.valid).eq(decoded_lane.rx_valid)
-					m.d.comb += Cat(self.source.symbol).eq(decoded_lane.rx_symbol)
 
 				#with m.Else():
 				#    m.d.rx += recv_tsn.eq(0)

@@ -310,7 +310,8 @@ class PCIeScrambler(PCIeSERDESInterface):
 		self.det_valid    = lane.det_valid
 		self.det_status   = lane.det_status
 #
-		self.enable        = Signal()
+		self.enable        = Signal() # TX scrambling
+		self.rx_enable     = Signal() # RX descrambling, independent of what TX is sending
 #
 		self.frequency    = lane.frequency
 		self.speed        = lane.speed
@@ -361,7 +362,7 @@ class PCIeScrambler(PCIeSERDESInterface):
 		#with m.Else():
 		#    m.d.rx += self.rx_symbol.eq(self.__lane.rx_symbol)
 
-		scramble(self.__lane.rx_symbol, self.rx_symbol, self.enable)
+		scramble(self.__lane.rx_symbol, self.rx_symbol, self.rx_enable)
 		scramble(self.tx_symbol, self.__lane.tx_symbol, self.enable)
 
 		i1 = Signal(len(self.__lane.rx_symbol)) # TODO: This is for debug, remove

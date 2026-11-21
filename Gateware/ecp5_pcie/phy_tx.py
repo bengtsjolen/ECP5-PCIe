@@ -34,6 +34,8 @@ class PCIePhyTX(Elaboratable):
 		self.enable_higher_layers = Signal()
 		self.ltssm_L0 = Signal()
 		self.idle_symbol = Signal(9, reset = 1)
+		# The TLP framer's data path doesn't survive a stall, so no SKP while it's (about to be) sending
+		self.hold_skp = Signal()
 
 		self.state = [
 			self.ts, self.ltssm_L0, self.enable_higher_layers
@@ -107,7 +109,7 @@ class PCIePhyTX(Elaboratable):
 				#with m.If(skp_accumulator > 0):
 				#    m.d.comb += self.sink.ready.eq(0)
 
-				with m.If((skp_accumulator > 0) & ~sending_old & ~sending_data):#(~sending_data | ((last_symbols[3] == Ctrl.END) | (last_symbols[3] == Ctrl.EDB)))):
+				with m.If((skp_accumulator > 0) & ~sending_old & ~sending_data & ~self.hold_skp):#(~sending_data | ((last_symbols[3] == Ctrl.END) | (last_symbols[3] == Ctrl.EDB)))):
 					m.d.comb += self.sink.ready.eq(0)
 					send(Ctrl.COM, Ctrl.SKP, Ctrl.SKP, Ctrl.SKP)
 					m.d.rx += [

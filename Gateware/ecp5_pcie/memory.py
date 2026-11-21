@@ -69,6 +69,11 @@ class TLPBuffer(Elaboratable):
 		self.delete_on_send = delete_on_send
 		"""Whether TLPs are deleted after they have been sent"""
 
+		self.ack_enable = Signal()
+		"""Delete every TLP whose ID is ack_id or older, modulo 4096 (Ack/Nak are cumulative)"""
+		self.ack_id = Signal(12)
+		"""Newest acknowledged ID for ack_enable"""
+
 		self.in_buffer = Signal()
 		"""Whether TLP in_buffer_id is in the buffer, comb domain"""
 		self.in_buffer_id = Signal(12)
@@ -113,8 +118,8 @@ class TLPBuffer(Elaboratable):
 		
 		m.d.comb += self.in_buffer.eq(valid_id_check)
 
-		with m.If(self.slots_empty):
-			m.d.rx += self.slots_occupied.eq(0)
+		# Counted from the slots: a store and a delete in the same cycle would lose one update.
+		m.d.comb += self.slots_occupied.eq(sum(slot[0] for slot in self.slots))
 
 		with m.FSM(name = "send_fsm", domain = "rx"):
 			with m.State("Idle"):
@@ -167,7 +172,13 @@ class TLPBuffer(Elaboratable):
 			for i in range(self.max_tlps):
 				with m.If(self.slots[i][0] & (self.delete_tlp_id == self.slots[i][1])):
 					m.d.rx += self.slots[i][0].eq(0)
-					m.d.rx += self.slots_occupied.eq(self.slots_occupied - 1)
+
+		with m.If(self.ack_enable):
+			for i in range(self.max_tlps):
+				age = Signal(12, name=f"ack_age_{i}")
+				m.d.comb += age.eq(self.ack_id - self.slots[i][1])
+				with m.If(self.slots[i][0] & ~age[11]):
+					m.d.rx += self.slots[i][0].eq(0)
 
 
 		end_tlp = Signal()
@@ -228,11 +239,12 @@ class TLPBuffer(Elaboratable):
 					m.d.rx += self.tlp_sink.ready.eq(0)
 					m.d.rx += write_address_counter.eq(0)
 					m.d.rx += write_port.en.eq(0)
-					m.d.rx += self.slots_occupied.eq(self.slots_occupied + 1)
 
-					for i in range(self.max_tlps): # TODO: This can also be solved with amaranth.lib.coding.PriorityEncoder
-						with m.If((offset == i) & ~slot_exists & ~self.slots_full):
-							m.d.rx += self.slots[i][0].eq(1) # TODO: Should this be moved down to Receive to the transition to Idle in case a TLP is being stored incompletely?
+					# Mark the slot the TLP was written to. `offset` is recomputed from the current
+					# slots and points elsewhere once a slot was freed while this TLP was stored.
+					for i in range(self.max_tlps):
+						with m.If(write_address_base == i):
+							m.d.rx += self.slots[i][0].eq(1)
 							m.d.rx += self.slots[i][1].eq(self.store_tlp_id)
 
 					m.next = "Idle"

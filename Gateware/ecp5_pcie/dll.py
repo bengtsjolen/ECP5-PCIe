@@ -157,6 +157,7 @@ class PCIeDLL(Elaboratable): # Based on Yumewatary phy.py
 					done_dllp_transmission.eq(0),
 					transmit_dllps.eq(0),
 					self.received_ack_nak.eq(0),
+					self.received_ack_nak_id.eq(0xFFF), # TLP sequence numbers restart at 0
 				]
 
 				with m.If(self.ltssm.status.link.up): # TODO: link on transaction layer must not be disabled

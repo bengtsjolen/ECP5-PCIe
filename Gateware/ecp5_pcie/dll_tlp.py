@@ -20,6 +20,7 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 
 		self.send = Signal()
 		self.started_sending = Signal()
+		self.busy = Signal() # A TLP is being framed, from its first symbol until END
 		self.accepts_tlps = Signal()
 		self.nullify = Signal() # if this is 1 towards the end of the TLP, the TLP will be nullified (set to 1 in rx domain, will be set to 0 by this module)
 		assert len(self.dllp_source.symbol) == 4
@@ -63,11 +64,17 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 		source_from_buffer = Signal()
 		sink_ready = Signal()
 		m.d.comb += buffer.tlp_source.ready.eq(sink_ready & source_from_buffer)
-		m.d.comb += self.tlp_sink.ready.eq(sink_ready & ~source_from_buffer & ~buffer.slots_full)
 		sink_valid = Mux(source_from_buffer, buffer.tlp_source.all_valid, self.tlp_sink.all_valid)
 		sink_symbol = [Mux(source_from_buffer, buffer.tlp_source.symbol[i], self.tlp_sink.symbol[i]) for i in range(ratio)]
 
-		self.tlp_sink.connect(buffer.tlp_sink, m.d.comb)
+		# The framing FSM starts on a rising valid and ends on a falling one, and the retry buffer
+		# stores in parallel. So a source must wait for ready, then send the whole TLP with valid
+		# held, then drop valid. Ready is low during a replay and while a TLP's END is framed.
+		for i in range(ratio):
+			m.d.comb += buffer.tlp_sink.symbol[i].eq(self.tlp_sink.symbol[i])
+			m.d.comb += buffer.tlp_sink.valid[i].eq(self.tlp_sink.valid[i])
+		ending = Signal()
+		m.d.comb += self.tlp_sink.ready.eq(buffer.tlp_sink.ready & ~source_from_buffer & ~ending)
 
 		with m.If(self.dll.up):
 			m.d.comb += buffer.store_tlp.eq(1) # TODO: Is this a good idea?
@@ -88,34 +95,59 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 			m.d.rx += self.replay_timer_running.eq(0)
 			m.d.rx += self.replay_timer.eq(0)
 
+		# Replays only the oldest unacknowledged TLP, so sources must keep at most one outstanding
+		# (retry_buffer_occupation == 0 before starting the next).
+		replay_guard = Signal(5)
 		with m.FSM(name="Replay_FSM", domain = "rx"):
 			with m.State("Idle"):
 				m.d.rx += source_from_buffer.eq(0)
 
-				with m.If(self.replay_timer >= self.replay_timeout):
-					m.next = "Replay"
-				
-				with m.If(self.dll.received_ack_nak & ~self.dll.received_ack):
+				replay = (self.replay_timer >= self.replay_timeout) | (self.dll.received_ack_nak & ~self.dll.received_ack)
+				with m.If(replay & ~buffer.slots_empty & ~self.busy & ~self.tlp_sink.all_valid):
+					m.d.rx += source_from_buffer.eq(1)
 					m.next = "Replay"
 
 			with m.State("Replay"):
-				m.d.rx += source_from_buffer.eq(1)
-				m.d.rx += self.replay_timer.eq(0) # TODO: This should be after the TLP is sent
+				m.d.rx += self.replay_timer.eq(0)
+				m.d.rx += replay_guard.eq(0)
 
 				with m.If(buffer.slots_empty):
+					m.d.rx += source_from_buffer.eq(0)
+					m.next = "Idle"
+
+				with m.Elif(~buffer.sending_tlp):
+					m.d.comb += buffer.send_tlp.eq(1)
+					m.next = "Replay-Start"
+
+			with m.State("Replay-Start"):
+				m.d.rx += self.replay_timer.eq(0)
+				m.d.rx += replay_guard.eq(replay_guard + 1)
+
+				with m.If(self.busy):
+					m.next = "Replay-End"
+
+				with m.Elif(replay_guard == 31): # The buffer did not find the TLP
+					m.d.rx += source_from_buffer.eq(0)
+					m.next = "Idle"
+
+			with m.State("Replay-End"):
+				m.d.rx += self.replay_timer.eq(0)
+
+				with m.If(~self.busy):
 					m.d.rx += source_from_buffer.eq(0)
 					m.next = "Idle"
 		
 		m.d.rx += self.ackd_seq.eq(self.dll.received_ack_nak_id)
 
-		# If ACK received:
-		# Delete entry from retry buffer and advance unacknowledged_tlp_fifo
-		# TODO: This doesn't check whether the ID stored in the FIFO was the one which was acknowledged. Maybe it can be replaced with a counter or that can be checked.
-		with m.If(self.dll.received_ack_nak & self.dll.received_ack):
-			m.d.comb += buffer.delete_tlp.eq(1)
-			m.d.comb += buffer.delete_tlp_id.eq(self.dll.received_ack_nak_id)
-			m.d.comb += unacknowledged_tlp_fifo.r_en.eq(1)
+		# Ack and Nak both acknowledge every TLP up to their ID, and the partner may acknowledge
+		# several TLPs with one Ack. Drop all of them from the retry buffer and the FIFO.
+		m.d.comb += buffer.ack_enable.eq(self.dll.up)
+		m.d.comb += buffer.ack_id.eq(self.ackd_seq)
+		fifo_age = Signal(12)
+		m.d.comb += fifo_age.eq(self.ackd_seq - unacknowledged_tlp_fifo.r_data)
+		m.d.comb += unacknowledged_tlp_fifo.r_en.eq(unacknowledged_tlp_fifo.r_rdy & ~fifo_age[11])
 
+		with m.If(self.dll.received_ack_nak):
 			m.d.comb += buffer.in_buffer_id.eq(self.dll.received_ack_nak_id)
 			with m.If(buffer.in_buffer):
 				m.d.rx += self.replay_timer.eq(0)
@@ -178,12 +210,14 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 				m.d.comb += self.debug[4].eq(reset_crc)
 
 				with m.State("Idle"):
+					# A replay keeps the TLP's original sequence number.
+					seq = Mux(source_from_buffer, unacknowledged_tlp_fifo.r_data, self.next_transmit_seq)
 					with m.If(~last_valid & sink_valid):
 						m.d.comb += reset_crc.eq(0)
-						m.d.comb += crc_input.eq(Cat(self.next_transmit_seq[8 : 12], Const(0, shape = 4), self.next_transmit_seq[0 : 8]))
+						m.d.comb += crc_input.eq(Cat(seq[8 : 12], Const(0, shape = 4), seq[0 : 8]))
 						m.d.rx += even_more_delay[0].eq(Ctrl.STP)
-						m.d.rx += even_more_delay[1].eq(self.next_transmit_seq[8 : 12])
-						m.d.rx += even_more_delay[2].eq(self.next_transmit_seq[0 : 8])
+						m.d.rx += even_more_delay[1].eq(seq[8 : 12])
+						m.d.rx += even_more_delay[2].eq(seq[0 : 8])
 						m.d.rx += even_more_delay[3].eq(tlp_bytes[8 * 0 : 8 * 1])
 						m.next = "Transmit"
 
@@ -234,9 +268,10 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 
 					with m.Else():
 						m.d.rx += self.dllp_source.symbol[3].eq(Ctrl.END)
-						m.d.rx += unacknowledged_tlp_fifo.w_data.eq(self.next_transmit_seq)
-						m.d.rx += unacknowledged_tlp_fifo.w_en.eq(1)
-						m.d.rx += self.next_transmit_seq.eq(self.next_transmit_seq + 1)
+						with m.If(~source_from_buffer):
+							m.d.rx += unacknowledged_tlp_fifo.w_data.eq(self.next_transmit_seq)
+							m.d.rx += unacknowledged_tlp_fifo.w_en.eq(1)
+							m.d.rx += self.next_transmit_seq.eq(self.next_transmit_seq + 1)
 					
 					m.d.rx += self.replay_timer_running.eq(1) # TODO: Maybe this should be in the Else block above
 
@@ -245,7 +280,8 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 
 					m.next = "Idle"
 
-
+		m.d.comb += self.busy.eq(~fsm.ongoing("Idle"))
+		m.d.comb += ending.eq(fsm.ongoing("Post-1") | fsm.ongoing("Post-2"))
 
 
 		# TODO: This could be a FSM

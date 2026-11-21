@@ -45,6 +45,7 @@ class PCIeDLLPTransmitter(Elaboratable):
 		self.dllp_sink = StreamInterface(9, ratio, name="DLLP_Sink")
 		self.send = Signal()
 		self.started_sending = Signal()
+		self.hold = Signal() # Don't start a DLLP: the TLP transmitter is about to send, and TLP data would cut its second half off
 		assert len(self.phy_source.symbol) == 4
 		assert len(self.dllp_sink.symbol) == 4
 		self.ratio = len(self.phy_source.symbol)
@@ -87,7 +88,7 @@ class PCIeDLLPTransmitter(Elaboratable):
 					m.d.rx += self.phy_source.symbol[i].eq(self.dllp_sink.symbol[i])
 					m.d.rx += self.phy_source.valid[i].eq(self.dllp_sink.valid[i]) # TODO: Fix this
 
-			with m.Elif(dllp.valid & (self.send | which_half)):
+			with m.Elif(dllp.valid & ((self.send & ~self.hold) | which_half)):
 				#m.d.comb += self.dllp_sink.ready.eq(0)
 				for i in range(4):
 					m.d.rx += self.phy_source.valid[i].eq(1)
@@ -157,6 +158,10 @@ class PCIeDLLPReceiver(Elaboratable):
 		
 		m.d.comb += valid.eq(~Cat(crc.output[::-1]) == dllp_bytes[8 * 4:])
 
+		# One cycle per received DLLP, otherwise every consumer acts on the last DLLP again each
+		# cycle (an Ack popping the replay FIFO, a Nak replaying over and over). The other fields
+		# stay latched.
+		m.d.rx += dllp.valid.eq(0)
 		with m.If(valid & received):
 			m.d.rx += dllp.valid.eq(1)
 			m.d.rx += dllp.type.eq(dllp_bytes[4:8])
