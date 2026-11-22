@@ -78,6 +78,16 @@ class ECP5PCIeCore(Elaboratable):
 		self.tx_seq_num  = Signal(12, name="tx_seq_num")
 		self.rx_seq_num  = Signal(12, name="rx_seq_num")
 
+		# Retry buffer debug: Ack/Nak DLLPs as they are received, replay events, and a snapshot of
+		# ackd_seq[0:12], FIFO r_data[12:24], r_level[24:27], r_rdy[27], replay state[28:30],
+		# slot valid[30:34] and slot IDs[34:82].
+		self.ack_nak_valid    = Signal(name="ack_nak_valid")
+		self.ack_nak_ack      = Signal(name="ack_nak_ack")
+		self.ack_nak_id       = Signal(12, name="ack_nak_id")
+		self.replay_started   = Signal(name="replay_started")
+		self.replay_abandoned = Signal(name="replay_abandoned")
+		self.retry_debug      = Signal(96, name="retry_debug")
+
 		self.tlp_rx_data  = Signal(32, name="tlp_rx_data")
 		self.tlp_rx_valid = Signal(4,  name="tlp_rx_valid")
 		self.tlp_rx_ready = Signal(name="tlp_rx_ready")
@@ -94,6 +104,8 @@ class ECP5PCIeCore(Elaboratable):
 			self.rx_symbol, self.rx_valid, self.tx_symbol,
 			*self.credits_rx.values(),
 			self.retry_buffer_occupation, self.receive_buffer_occupation, self.tx_seq_num, self.rx_seq_num,
+			self.ack_nak_valid, self.ack_nak_ack, self.ack_nak_id,
+			self.replay_started, self.replay_abandoned, self.retry_debug,
 			self.tlp_rx_data, self.tlp_rx_valid, self.tlp_rx_ready,
 			self.tlp_tx_data, self.tlp_tx_valid, self.tlp_tx_ready,
 		]
@@ -164,6 +176,20 @@ class ECP5PCIeCore(Elaboratable):
 		]
 		for f, sig in self.credits_rx.items():
 			m.d.comb += sig.eq(getattr(phy.dll.credits_rx, f))
+
+		tx_dll = phy.dll_tlp_tx
+		fifo   = tx_dll.unacknowledged_tlp_fifo
+		slots  = tx_dll.buffer.slots
+		m.d.comb += [
+			self.ack_nak_valid   .eq(phy.dll.received_ack_nak),
+			self.ack_nak_ack     .eq(phy.dll.received_ack),
+			self.ack_nak_id      .eq(phy.dll.received_ack_nak_id),
+			self.replay_started  .eq(tx_dll.replay_started),
+			self.replay_abandoned.eq(tx_dll.replay_abandoned),
+			self.retry_debug.eq(Cat(
+				tx_dll.ackd_seq, fifo.r_data, fifo.r_level[:3], fifo.r_rdy, tx_dll.replay_state,
+				Cat(slot[0] for slot in slots), Cat(slot[1] for slot in slots))),
+		]
 
 		tlp_rx = phy.dll_tlp_rx.tlp_source
 		tlp_tx = phy.dll_tlp_tx.tlp_sink

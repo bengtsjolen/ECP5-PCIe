@@ -44,6 +44,14 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 		self.debug = Signal(8)
 		self.debug_state = Signal(4)
 
+		self.buffer = TLPBuffer(ratio = ratio, max_tlps = 2 ** len(self.replay_num))
+		self.unacknowledged_tlp_fifo = SyncFIFOBuffered(width = 12, depth = self.buffer.max_tlps)
+		self.replay_state = Signal(2)
+		self.replay_started = Signal()
+		"""1 for a cycle when a replay starts"""
+		self.replay_abandoned = Signal()
+		"""1 for a cycle when the retry buffer did not deliver the TLP to replay"""
+
 		self.state = [
 			self.debug_state
 		]
@@ -55,8 +63,8 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 		assert ratio == 4
 
 		# Maybe these should be moved into PCIeDLLTLP class since it also involves RX a bit
-		m.submodules.buffer = buffer = TLPBuffer(ratio = ratio, max_tlps = 2 ** len(self.replay_num))
-		m.submodules.unacknowledged_tlp_fifo = unacknowledged_tlp_fifo = SyncFIFOBuffered(width = 12, depth = buffer.max_tlps)
+		m.submodules.buffer = buffer = self.buffer
+		m.submodules.unacknowledged_tlp_fifo = unacknowledged_tlp_fifo = DomainRenamer("rx")(self.unacknowledged_tlp_fifo)
 
 		m.d.comb += self.dll.status.retry_buffer_occupation.eq(buffer.slots_occupied)
 		m.d.comb += self.dll.status.tx_seq_num.eq(self.next_transmit_seq)
@@ -98,13 +106,16 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 		# Replays only the oldest unacknowledged TLP, so sources must keep at most one outstanding
 		# (retry_buffer_occupation == 0 before starting the next).
 		replay_guard = Signal(5)
-		with m.FSM(name="Replay_FSM", domain = "rx"):
+		with m.FSM(name="Replay_FSM", domain = "rx") as replay_fsm:
+			m.d.comb += self.replay_state.eq(replay_fsm.state)
+
 			with m.State("Idle"):
 				m.d.rx += source_from_buffer.eq(0)
 
 				replay = (self.replay_timer >= self.replay_timeout) | (self.dll.received_ack_nak & ~self.dll.received_ack)
 				with m.If(replay & ~buffer.slots_empty & ~self.busy & ~self.tlp_sink.all_valid):
 					m.d.rx += source_from_buffer.eq(1)
+					m.d.comb += self.replay_started.eq(1)
 					m.next = "Replay"
 
 			with m.State("Replay"):
@@ -127,6 +138,7 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 					m.next = "Replay-End"
 
 				with m.Elif(replay_guard == 31): # The buffer did not find the TLP
+					m.d.comb += self.replay_abandoned.eq(1)
 					m.d.rx += source_from_buffer.eq(0)
 					m.next = "Idle"
 
