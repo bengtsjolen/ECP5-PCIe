@@ -112,10 +112,11 @@ class PCIePhyTX(Elaboratable):
 				with m.If((skp_accumulator > 0) & ~sending_old & ~sending_data & ~self.hold_skp):#(~sending_data | ((last_symbols[3] == Ctrl.END) | (last_symbols[3] == Ctrl.EDB)))):
 					m.d.comb += self.sink.ready.eq(0)
 					send(Ctrl.COM, Ctrl.SKP, Ctrl.SKP, Ctrl.SKP)
+					# sending_ts stays 0: it turns TX scrambling off two cycles later, which sent
+					# the word after next unscrambled, and SKP sets are K symbols anyway.
 					m.d.rx += [
 						self.enable_higher_layers.eq(0),
 						skp_accumulator.eq(skp_accumulator - 1),
-						self.sending_ts.eq(1),
 					]
 
 				with m.Elif(ts.valid):

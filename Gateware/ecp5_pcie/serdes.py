@@ -331,28 +331,20 @@ class PCIeScrambler(PCIeSERDESInterface):
 		def scramble(input, output, enable):
 			lfsr = PCIeLFSR(self.ratio, input[0:9] == Ctrl.COM, input[9:18] != Ctrl.SKP)
 			m.submodules += lfsr 
-			with m.If(enable & (input[8] == 0)):
-				m.d.rx += output[0:9].eq(lfsr.output[0:9] ^ input[0:9])
-
-			with m.Else():
-				m.d.rx += output[0:9].eq(input[0:9])
-				
-				
-			with m.If(enable & (input[17] == 0)):
-				with m.If(input[0:9] == Ctrl.COM): # TODO: This is a hack. Please fix.
-					m.d.rx += output[9:18].eq(0xFF ^ input[9:18])
-
+			# Each symbol on its own: data symbols are scrambled, K symbols pass. This used to be
+			# decided for symbols 1 to 3 by symbol 1 alone, so the data after a STP, SDP or END
+			# in lane 1 was not (de)scrambled, and a packet starting there was lost.
+			for i in range(self.ratio):
+				symbol = input[9 * i : 9 * i + 9]
+				key = lfsr.output[9 * i : 9 * i + 9]
+				if i == 1:
+					# TODO: This is a hack. Please fix. The LFSR output for the symbol after a COM
+					key = Mux(input[0:9] == Ctrl.COM, 0xFF, key)
+				with m.If(enable & (symbol[8] == 0)):
+					m.d.rx += output[9 * i : 9 * i + 9].eq(key ^ symbol)
 				with m.Else():
-					m.d.rx += output[9:18].eq(lfsr.output[9:18] ^ input[9:18])
+					m.d.rx += output[9 * i : 9 * i + 9].eq(symbol)
 
-				if (self.ratio > 2):
-					for i in range(2, self.ratio):
-						m.d.rx += output[9 * i : 9 * i + 9].eq(Mux(input[9 * i : 9 * i + 9][8], 0, lfsr.output[9 * i : 9 * i + 9]) ^ input[9 * i : 9 * i + 9])
-
-			with m.Else():
-				for i in range(1, self.ratio):
-					m.d.rx += output[9 * i : 9 * i + 9].eq(input[9 * i : 9 * i + 9])
-			
 
 		#with m.If(self.enable & (self.__lane.rx_symbol[8] == 0)):
 		#    with m.If(self.__lane.rx_symbol[0:9] == Ctrl.COM):

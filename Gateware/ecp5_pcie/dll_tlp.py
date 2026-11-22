@@ -34,7 +34,7 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 		self.ackd_seq = Signal(12, reset=0xFFF) # Last acknowledged TLP
 		self.replay_num = Signal(2, reset=0b00) # Number of times the retry buffer has been re-transmitted
 		self.replay_timeout = 462 # TODO: is 462 right number? See page 148 Table 3-4 PCIe 1.1
-		self.replay_timer = Signal(range(self.replay_timeout), reset=0)  # Time since last TLP has finished transmitting, hold if LTSSM in recovery
+		self.replay_timer = Signal(range(self.replay_timeout + 1), reset=0)  # Time with unacknowledged TLPs and no Ack progress, stops at replay_timeout
 		self.replay_timer_running = Signal()
 
 
@@ -96,12 +96,15 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 		
 		m.d.rx += self.accepts_tlps.eq((self.next_transmit_seq - self.ackd_seq) >= 2048) # mod 4096 is already applied since the signal is 12 bits long
 
-		with m.If(self.replay_timer_running):
-			m.d.rx += self.replay_timer.eq(self.replay_timer + 1)
-
-		with m.If(unacknowledged_tlp_fifo.r_level == 0):
-			m.d.rx += self.replay_timer_running.eq(0)
+		# REPLAY_TIMER: counts while the retry buffer holds a TLP and restarts on an Ack/Nak for a
+		# buffered TLP and during a replay (both further down). It used to be started when a TLP
+		# ended and stopped while the unacknowledged FIFO was empty, which that TLP only enters
+		# two cycles later, so it never ran for a single outstanding TLP and a lost Ack was final.
+		m.d.comb += self.replay_timer_running.eq(~buffer.slots_empty)
+		with m.If(~self.replay_timer_running):
 			m.d.rx += self.replay_timer.eq(0)
+		with m.Elif(self.replay_timer < self.replay_timeout):
+			m.d.rx += self.replay_timer.eq(self.replay_timer + 1)
 
 		# Replays only the oldest unacknowledged TLP, so sources must keep at most one outstanding
 		# (retry_buffer_occupation == 0 before starting the next).
@@ -285,8 +288,6 @@ class PCIeDLLTLPTransmitter(Elaboratable):
 							m.d.rx += unacknowledged_tlp_fifo.w_en.eq(1)
 							m.d.rx += self.next_transmit_seq.eq(self.next_transmit_seq + 1)
 					
-					m.d.rx += self.replay_timer_running.eq(1) # TODO: Maybe this should be in the Else block above
-
 					for i in range(4):
 						m.d.rx += self.dllp_source.valid[i].eq(1)
 
@@ -447,12 +448,14 @@ class PCIeDLLTLPReceiver(Elaboratable):
 			m.d.rx += buffer.tlp_sink.symbol[i].eq(Cat(source_symbols[i]))
 		
 		end_good = Signal()
+		seq_behind = Signal(12)
+		m.d.comb += seq_behind.eq(self.next_receive_seq - self.actual_receive_seq)
 
-		def ack():
+		def ack(seq):
 			m.d.comb += self.dll.schedule_ack_nak.eq(1)
 			m.d.rx += [
 				self.dll.scheduled_ack.eq(1),
-				self.dll.scheduled_ack_nak_id.eq(self.actual_receive_seq),
+				self.dll.scheduled_ack_nak_id.eq(seq),
 				self.ack_nak_latency_timer.eq(self.ack_nak_latency_timer.reset),
 			]
 		
@@ -528,14 +531,17 @@ class PCIeDLLTLPReceiver(Elaboratable):
 							m.d.comb += received_tlp_fifo.w_data.eq(self.actual_receive_seq)
 							m.d.rx += self.next_receive_seq.eq(self.next_receive_seq + 1)
 							m.d.rx += self.nak_scheduled.eq(0)
-							ack()
+							ack(self.actual_receive_seq)
 							m.d.comb += Cat(self.debug[4:8]).eq(1)
 						with m.Else():
 							m.d.comb += Cat(self.debug[4:8]).eq(2)
 
-					with m.Elif((self.next_receive_seq - self.actual_receive_seq) <= 2048): # Duplicate received
+					# Sequence numbers are modulo 4096. Compared as plain integers, a TLP ahead of
+					# next_receive_seq (the ones before it were lost) counted as a duplicate and
+					# was acknowledged, which acknowledged the lost ones along with it.
+					with m.Elif(seq_behind <= 2048): # Duplicate received
 						delete_stored()
-						ack()
+						ack(self.next_receive_seq - 1)
 						m.d.comb += Cat(self.debug[4:8]).eq(3)
 
 					with m.Else():
